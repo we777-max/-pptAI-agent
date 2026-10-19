@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Annotated, Literal
 
-from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, field_validator
+from pydantic import AliasChoices, BaseModel, ConfigDict, Field, HttpUrl, field_validator, model_validator
 
 
 class IRModel(BaseModel):
@@ -91,6 +91,12 @@ class ImageElement(IRModel):
 SlideElement = Annotated[TextElement | ShapeElement | ImageElement, Field(discriminator="type")]
 
 
+# 画布单位统一为英寸，渲染侧再换算成 EMU/像素。
+# 该容差用于吸收最后一次源于浮点运算的误差，不改语义。
+CANVAS_TOLERANCE = 0.01
+MAX_ELEMENTS_PER_SLIDE = 500
+
+
 class SlideIR(IRModel):
     id: str
     width: float = Field(default=13.333, gt=0)
@@ -100,13 +106,23 @@ class SlideIR(IRModel):
     notes: str | None = None
     metadata: dict[str, object] = Field(default_factory=dict)
 
-    @field_validator("elements")
-    @classmethod
-    def elements_within_canvas(cls, elements: list[SlideElement]) -> list[SlideElement]:
-        # Canvas dimensions are validated by the renderer; this keeps IR validation local and composable.
-        if len(elements) > 500:
-            raise ValueError("a slide may contain at most 500 elements")
-        return elements
+    @model_validator(mode="after")
+    def elements_within_canvas(self) -> "SlideIR":
+        # IR 是单一事实来源，因此画布约束在这里就地生效，
+        # 使一份 IR 无论走 API 写入、Agent 生成还是渲染器消费都保持一致。
+        if len(self.elements) > MAX_ELEMENTS_PER_SLIDE:
+            raise ValueError(f"a slide may contain at most {MAX_ELEMENTS_PER_SLIDE} elements, got {len(self.elements)}")
+        for element in self.elements:
+            frame = element.frame
+            overflow_x = frame.x + frame.w - self.width
+            overflow_y = frame.y + frame.h - self.height
+            if overflow_x > CANVAS_TOLERANCE or overflow_y > CANVAS_TOLERANCE:
+                raise ValueError(
+                    f"element {element.id!r} exceeds canvas of slide {self.id!r} "
+                    f"({self.width}x{self.height}): extents reach "
+                    f"{frame.x + frame.w:.4f}x{frame.y + frame.h:.4f}"
+                )
+        return self
 
 
 class DeckIR(IRModel):
